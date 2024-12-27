@@ -9,6 +9,10 @@ from sklearn.metrics import mean_squared_error
 import time
 from requests.exceptions import ReadTimeout, ConnectionError
 from concurrent.futures import ThreadPoolExecutor
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Set page config
 st.set_page_config(
@@ -31,27 +35,49 @@ st.markdown("""
 st.markdown('<p class="big-font">NBA Game Predictions 🏀</p>', unsafe_allow_html=True)
 
 # Common Functions
-def get_team_roster(team_abbreviation):
-    try:
-        team_info = teams.find_team_by_abbreviation(team_abbreviation)
-        if not team_info:
-            st.error(f"Team '{team_abbreviation}' not found.")
+
+def get_team_roster(team_abbreviation, max_retries=5, initial_timeout=60):
+    """
+    Fetch the roster for a given team with retry logic and increased timeout.
+
+    Parameters:
+        team_abbreviation (str): The abbreviation of the team.
+        max_retries (int): Maximum number of retries for API calls.
+        initial_timeout (int): Initial timeout duration for API calls.
+
+    Returns:
+        list: List of player full names.
+    """
+    timeout = initial_timeout
+    for attempt in range(max_retries):
+        try:
+            team_info = teams.find_team_by_abbreviation(team_abbreviation)
+            if not team_info:
+                logging.error(f"Team '{team_abbreviation}' not found.")
+                return []
+
+            team_id = team_info['id']
+            roster = commonteamroster.CommonTeamRoster(team_id=team_id, timeout=timeout).get_data_frames()[0]
+            return roster['PLAYER'].tolist()
+        except (ReadTimeout, ConnectionError) as e:
+            if attempt < max_retries - 1:
+                logging.warning(f"Timeout error fetching roster for team '{team_abbreviation}'. Retrying... ({attempt + 1}/{max_retries})")
+                time.sleep(2 ** attempt)  # Exponential backoff
+                timeout *= 1.5  # Increase timeout for the next attempt
+            else:
+                logging.error(f"Failed to fetch roster for team '{team_abbreviation}' after {max_retries} attempts.")
+                return []
+        except Exception as e:
+            logging.error(f"Unexpected error fetching roster for team '{team_abbreviation}': {e}")
             return []
-        
-        team_id = team_info['id']
-        roster = commonteamroster.CommonTeamRoster(team_id=team_id).get_data_frames()[0]
-        return roster['PLAYER'].tolist()
-    except Exception as e:
-        st.error(f"Error getting roster: {e}")
-        return []
-    
+
 @st.cache_data
 def get_player_data(player_name, max_retries=3):
     for attempt in range(max_retries):
         try:
             player_dict = players.find_players_by_full_name(player_name)
             if not player_dict:
-                st.error(f"Player '{player_name}' not found.")
+                logging.error(f"Player '{player_name}' not found.")
                 return None
             
             player_id = player_dict[0]['id']
@@ -75,14 +101,17 @@ def get_player_data(player_name, max_retries=3):
             
         except (ReadTimeout, ConnectionError) as e:
             if attempt < max_retries - 1:
+                logging.warning(f"Timeout error fetching data for {player_name}. Retrying... ({attempt + 1}/{max_retries})")
                 time.sleep(2)
             else:
-                st.error(f"Failed to fetch data for {player_name} after {max_retries} attempts")
+                logging.error(f"Failed to fetch data for {player_name} after {max_retries} attempts")
                 return None
-    pass
+        except Exception as e:
+            logging.error(f"Unexpected error fetching data for {player_name}: {e}")
+            return None
 
 def fetch_all_player_data(roster):
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:  # Adjust max_workers based on your system's capabilities
         player_data = list(executor.map(get_player_data, roster))
     return player_data
 
