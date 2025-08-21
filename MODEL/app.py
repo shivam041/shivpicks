@@ -56,7 +56,8 @@ st.markdown("""
 
 # Constants
 CACHE_TTL = 3600  # 1 hour cache
-API_TIMEOUT = 10  # 10 second timeout
+API_TIMEOUT = 30  # Increased to 30 seconds
+MAX_RETRIES = 3   # Add retry logic
 
 @st.cache_data(ttl=CACHE_TTL)
 def get_player_id_fast(player_name):
@@ -72,32 +73,41 @@ def get_player_id_fast(player_name):
 
 @st.cache_data(ttl=CACHE_TTL)
 def get_player_data_fast(player_name, season='2024-25'):
-    """Get player data with minimal processing."""
-    try:
-        player_id = get_player_id_fast(player_name)
-        if not player_id:
-            return None
-        
-        # Get current season data first
-        gamelog = playergamelog.PlayerGameLog(
-            player_id=player_id, 
-            season=season,
-            timeout=API_TIMEOUT
-        ).get_data_frames()[0]
-        
-        if len(gamelog) < 3:
-            # Try previous season if current season has insufficient data
-            prev_season = '2023-24'
+    """Get player data with retry logic and better timeout handling."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            player_id = get_player_id_fast(player_name)
+            if not player_id:
+                return None
+            
+            # Get current season data first
             gamelog = playergamelog.PlayerGameLog(
                 player_id=player_id, 
-                season=prev_season,
+                season=season,
                 timeout=API_TIMEOUT
             ).get_data_frames()[0]
-        
-        return gamelog
-    except Exception as e:
-        st.warning(f"⚠️ Could not fetch data for {player_name}: {str(e)}")
-        return None
+            
+            if len(gamelog) < 3:
+                # Try previous season if current season has insufficient data
+                prev_season = '2023-24'
+                gamelog = playergamelog.PlayerGameLog(
+                    player_id=player_id, 
+                    season=prev_season,
+                    timeout=API_TIMEOUT
+                ).get_data_frames()[0]
+            
+            return gamelog
+            
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                st.warning(f"⚠️ Attempt {attempt + 1} failed for {player_name}, retrying...")
+                time.sleep(1)  # Brief pause before retry
+                continue
+            else:
+                st.warning(f"⚠️ Could not fetch data for {player_name} after {MAX_RETRIES} attempts: {str(e)}")
+                return None
+    
+    return None
 
 def preprocess_data_fast(game_log):
     """Fast preprocessing with minimal calculations."""
@@ -214,6 +224,7 @@ def run_fast_predictions(home_team, away_team, model_type, rolling_window):
         
         total_players = len(roster)
         successful_predictions = 0
+        failed_players = []
         
         for idx, player_name in enumerate(roster):
             status_text.text(f"Processing {player_name}... ({idx+1}/{total_players})")
@@ -223,18 +234,21 @@ def run_fast_predictions(home_team, away_team, model_type, rolling_window):
                 game_log = get_player_data_fast(player_name)
                 if game_log is None or len(game_log) < 3:
                     predictions[player_name] = "N/A - Not enough data"
+                    failed_players.append(f"{player_name} (insufficient data)")
                     continue
                 
                 # Preprocess data
                 recent_stats = preprocess_data_fast(game_log)
                 if recent_stats is None:
                     predictions[player_name] = "N/A - Data processing failed"
+                    failed_players.append(f"{player_name} (processing failed)")
                     continue
                 
                 # Train model
                 model, metrics = train_model_fast(game_log, model_type)
                 if model is None:
                     predictions[player_name] = "N/A - Model training failed"
+                    failed_players.append(f"{player_name} (model failed)")
                     continue
                 
                 # Make prediction
@@ -245,18 +259,26 @@ def run_fast_predictions(home_team, away_team, model_type, rolling_window):
                     successful_predictions += 1
                 else:
                     predictions[player_name] = "N/A - Prediction failed"
+                    failed_players.append(f"{player_name} (prediction failed)")
                 
             except Exception as e:
-                predictions[player_name] = f"N/A - Error: {str(e)[:50]}"
+                error_msg = f"N/A - Error: {str(e)[:50]}"
+                predictions[player_name] = error_msg
+                failed_players.append(f"{player_name} (error: {str(e)[:30]})")
             
             progress_bar.progress((idx + 1) / total_players)
         
         progress_bar.empty()
         status_text.empty()
         
+        # Show summary of results
         if successful_predictions > 0:
-            # Display results
             st.success(f"✅ Successfully predicted {successful_predictions}/{total_players} players")
+            
+            if failed_players:
+                with st.expander(f"⚠️ {len(failed_players)} players had issues"):
+                    for player in failed_players:
+                        st.write(f"• {player}")
             
             # Top scorer
             valid_predictions = {k: v for k, v in predictions.items() 
@@ -316,6 +338,10 @@ def run_fast_predictions(home_team, away_team, model_type, rolling_window):
                     st.metric("Average R² Score", f"{avg_r2:.3f}")
         else:
             st.warning(f"⚠️ No successful predictions for {team}")
+            if failed_players:
+                with st.expander(f"❌ All {len(failed_players)} players failed"):
+                    for player in failed_players:
+                        st.write(f"• {player}")
         
         results[team] = predictions
     
