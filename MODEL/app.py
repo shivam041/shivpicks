@@ -2,20 +2,21 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
-import altair as alt
+from nba_api.stats.static import players, teams
+from nba_api.stats.endpoints import playergamelog
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error
 import warnings
-from team_database import get_team_roster, get_all_team_abbreviations, get_team_name
-from comprehensive_nba import nba_analyzer
-from typing import Dict
-
 warnings.filterwarnings('ignore')
 
 # Set page config
 st.set_page_config(
-    page_title="NBA Comprehensive Predictions",
+    page_title="NBA Player Points Predictor",
     page_icon="🏀",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
 # Enhanced CSS styling
@@ -29,7 +30,7 @@ st.markdown("""
         margin-bottom: 2rem;
         text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
     }
-    .analysis-card {
+    .prediction-card {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 1.5rem;
         border-radius: 15px;
@@ -45,12 +46,6 @@ st.markdown("""
         text-align: center;
         margin: 0.5rem 0;
     }
-    .stats-container {
-        background: rgba(255, 255, 255, 0.1);
-        padding: 1rem;
-        border-radius: 10px;
-        margin: 0.5rem 0;
-    }
     .player-card {
         background: rgba(255, 255, 255, 0.05);
         padding: 1rem;
@@ -61,314 +56,451 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-def display_player_analysis(player_name: str, player_data: Dict):
-    """Display detailed player analysis."""
-    
-    with st.expander(f"📊 Detailed Analysis: {player_name}", expanded=False):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("### 🎯 Prediction Summary")
-            st.metric("Predicted Points", f"{player_data['predicted_points']:.1f}")
-            st.metric("Career Average", f"{player_data['career_avg']:.1f}")
-            st.metric("Recent Form", f"{player_data['recent_form']:.1f}")
-            st.metric("Home/Away Avg", f"{player_data['home_away_avg']:.1f}")
-            st.metric("vs Opponent", f"{player_data['vs_opponent_avg']:.1f}")
-        
-        with col2:
-            if player_data['analysis']:
-                analysis = player_data['analysis']
-                
-                st.markdown("### 📈 Advanced Metrics")
-                
-                if 'advanced_metrics' in analysis:
-                    metrics = analysis['advanced_metrics']
-                    st.metric("Efficiency", f"{metrics['efficiency']:.3f}")
-                    st.metric("Versatility", f"{metrics['versatility']:.2f}")
-                    st.metric("Consistency", f"{metrics['consistency']:.3f}")
-                    st.metric("Clutch Factor", f"{metrics['clutch_factor']:.3f}")
-                
-                if 'season_trends' in analysis:
-                    st.markdown("### 📅 Season Trends")
-                    for season, data in analysis['season_trends'].items():
-                        st.write(f"**{season}**: {data['avg_pts']:.1f} pts ({data['games_played']} games)")
+# Cache for NBA API calls
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def get_player_id(player_name: str):
+    """Get player ID from NBA API with caching."""
+    try:
+        all_players = players.get_players()
+        for player in all_players:
+            if player['full_name'].lower() == player_name.lower():
+                return player['id']
+        return None
+    except Exception as e:
+        st.error(f"Error getting player ID: {str(e)}")
+        return None
 
-def display_team_comparison(home_analysis: Dict, away_analysis: Dict):
-    """Display team comparison analysis."""
-    
-    st.markdown("## 🏆 Team Comparison")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown("### 🏠 Home Team")
-        st.metric("Total Predicted", f"{home_analysis['team_total']:.1f} pts")
-        st.metric("Team Average", f"{home_analysis['team_average']:.1f} pts")
-        st.metric("Players Analyzed", len([k for k in home_analysis.keys() if k not in ['team_total', 'team_average']]))
-    
-    with col2:
-        st.markdown("### ✈️ Away Team")
-        st.metric("Total Predicted", f"{away_analysis['team_total']:.1f} pts")
-        st.metric("Team Average", f"{away_analysis['team_average']:.1f} pts")
-        st.metric("Players Analyzed", len([k for k in away_analysis.keys() if k not in ['team_total', 'team_average']]))
-    
-    with col3:
-        st.markdown("### 🎯 Game Prediction")
-        home_total = home_analysis['team_total']
-        away_total = away_analysis['team_total']
-        predicted_winner = "Home Team" if home_total > away_total else "Away Team"
-        margin = abs(home_total - away_total)
-        
-        st.metric("Predicted Winner", predicted_winner)
-        st.metric("Predicted Margin", f"{margin:.1f} pts")
-        st.metric("Total Points", f"{home_total + away_total:.1f} pts")
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def get_player_game_logs(player_id: int, season: str = '2024-25'):
+    """Get player game logs with caching."""
+    try:
+        game_logs = playergamelog.PlayerGameLog(
+            player_id=player_id, 
+            season=season,
+            timeout=30
+        )
+        return game_logs.get_data_frames()[0]
+    except Exception as e:
+        st.warning(f"Could not fetch {season} game logs: {str(e)}")
+        return None
 
-def create_prediction_charts(home_analysis: Dict, away_analysis: Dict):
-    """Create visualization charts for predictions."""
+def preprocess_game_logs(game_logs: pd.DataFrame):
+    """Preprocess game logs for analysis."""
+    if game_logs is None or len(game_logs) == 0:
+        return None
     
-    # Player predictions chart
-    home_players = {k: v for k, v in home_analysis.items() if k not in ['team_total', 'team_average']}
-    away_players = {k: v for k, v in away_analysis.items() if k not in ['team_total', 'team_average']}
-    
-    # Prepare data for charts
-    chart_data = []
-    
-    for player_name, data in home_players.items():
-        chart_data.append({
-            'Player': player_name,
-            'Team': 'Home',
-            'Predicted Points': data['predicted_points'],
-            'Career Average': data['career_avg']
-        })
-    
-    for player_name, data in away_players.items():
-        chart_data.append({
-            'Player': player_name,
-            'Team': 'Away',
-            'Predicted Points': data['predicted_points'],
-            'Career Average': data['career_avg']
-        })
-    
-    df = pd.DataFrame(chart_data)
-    
-    # Top scorers chart
-    top_scorers = df.nlargest(10, 'Predicted Points')
-    
-    chart1 = alt.Chart(top_scorers).mark_bar().encode(
-        x=alt.X('Player:N', title='Player', sort='-y'),
-        y=alt.Y('Predicted Points:Q', title='Predicted Points'),
-        color=alt.Color('Team:N', scale=alt.Scale(range=['#4CAF50', '#FF6B6B'])),
-        tooltip=['Player', 'Team', 'Predicted Points', 'Career Average']
-    ).properties(
-        title='Top 10 Predicted Scorers',
-        width=700,
-        height=400
-    )
-    
-    st.altair_chart(chart1, use_container_width=True)
-    
-    # Team comparison chart
-    team_totals = pd.DataFrame([
-        {'Team': 'Home', 'Total Points': home_analysis['team_total']},
-        {'Team': 'Away', 'Total Points': away_analysis['team_total']}
-    ])
-    
-    chart2 = alt.Chart(team_totals).mark_bar().encode(
-        x='Team:N',
-        y='Total Points:Q',
-        color=alt.Color('Team:N', scale=alt.Scale(range=['#4CAF50', '#FF6B6B'])),
-        tooltip=['Team', 'Total Points']
-    ).properties(
-        title='Team Total Predictions',
-        width=400,
-        height=300
-    )
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.altair_chart(chart2, use_container_width=True)
-    
-    with col2:
-        # Prediction accuracy indicators
-        st.markdown("### 📊 Prediction Confidence")
+    try:
+        # Convert date and sort
+        game_logs['GAME_DATE'] = pd.to_datetime(game_logs['GAME_DATE'], errors='coerce')
+        game_logs = game_logs.sort_values('GAME_DATE', ascending=False)
         
-        # Calculate confidence based on data availability
-        home_confidence = len([k for k in home_analysis.keys() if k not in ['team_total', 'team_average'] and home_analysis[k]['analysis'] is not None]) / len(home_analysis.keys()) * 100
-        away_confidence = len([k for k in away_analysis.keys() if k not in ['team_total', 'team_average'] and away_analysis[k]['analysis'] is not None]) / len(away_analysis.keys()) * 100
+        # Convert numeric columns
+        numeric_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'FGM', 'FGA', 'FG_PCT', 
+                       'FG3M', 'FG3A', 'FG3_PCT', 'FTM', 'FTA', 'FT_PCT', 'PLUS_MINUS']
         
-        st.metric("Home Team Confidence", f"{home_confidence:.1f}%")
-        st.metric("Away Team Confidence", f"{away_confidence:.1f}%")
+        for col in numeric_cols:
+            if col in game_logs.columns:
+                game_logs[col] = pd.to_numeric(game_logs[col], errors='coerce').fillna(0)
+        
+        # Extract home/away and opponent
+        game_logs['IS_HOME'] = game_logs['MATCHUP'].str.contains('vs', na=False)
+        game_logs['IS_AWAY'] = game_logs['MATCHUP'].str.contains('@', na=False)
+        
+        # Extract opponent team
+        def extract_opponent(matchup):
+            try:
+                if pd.isna(matchup) or matchup == '':
+                    return 'UNK'
+                parts = str(matchup).split()
+                return parts[-1] if len(parts) > 1 else 'UNK'
+            except:
+                return 'UNK'
+        
+        game_logs['OPPONENT'] = game_logs['MATCHUP'].apply(extract_opponent)
+        
+        return game_logs
+        
+    except Exception as e:
+        st.error(f"Error preprocessing game logs: {str(e)}")
+        return None
 
-def run_comprehensive_analysis(home_team: str, away_team: str):
-    """Run comprehensive NBA analysis for both teams."""
+def calculate_player_stats(game_logs: pd.DataFrame, opponent_team: str):
+    """Calculate comprehensive player statistics."""
+    if game_logs is None or len(game_logs) == 0:
+        return None
     
-    st.markdown("## 🔍 Starting Comprehensive Analysis")
-    st.info("This analysis will examine 5 years of historical data, home/away splits, and advanced statistical factors for each player.")
+    try:
+        stats = {}
+        
+        # Overall averages
+        stats['career_avg_pts'] = game_logs['PTS'].mean()
+        stats['career_avg_reb'] = game_logs['REB'].mean()
+        stats['career_avg_ast'] = game_logs['AST'].mean()
+        stats['career_avg_fg_pct'] = game_logs['FG_PCT'].mean()
+        stats['career_avg_3p_pct'] = game_logs['FG3_PCT'].mean()
+        stats['career_avg_ft_pct'] = game_logs['FT_PCT'].mean()
+        
+        # Recent form (last 10 games)
+        recent_games = game_logs.head(10)
+        if len(recent_games) > 0:
+            stats['recent_avg_pts'] = recent_games['PTS'].mean()
+            stats['recent_avg_reb'] = recent_games['REB'].mean()
+            stats['recent_avg_ast'] = recent_games['AST'].mean()
+        else:
+            stats['recent_avg_pts'] = stats['career_avg_pts']
+            stats['recent_avg_reb'] = stats['career_avg_reb']
+            stats['recent_avg_ast'] = stats['career_avg_ast']
+        
+        # Home vs Away splits
+        home_games = game_logs[game_logs['IS_HOME'] == True]
+        away_games = game_logs[game_logs['IS_AWAY'] == True]
+        
+        if len(home_games) > 0:
+            stats['home_avg_pts'] = home_games['PTS'].mean()
+        else:
+            stats['home_avg_pts'] = stats['career_avg_pts']
+            
+        if len(away_games) > 0:
+            stats['away_avg_pts'] = away_games['PTS'].mean()
+        else:
+            stats['away_avg_pts'] = stats['career_avg_pts']
+        
+        # Performance against specific opponent
+        opponent_games = game_logs[game_logs['OPPONENT'] == opponent_team]
+        if len(opponent_games) > 0:
+            stats['vs_opponent_pts'] = opponent_games['PTS'].mean()
+            stats['vs_opponent_games'] = len(opponent_games)
+        else:
+            stats['vs_opponent_pts'] = stats['career_avg_pts']
+            stats['vs_opponent_games'] = 0
+        
+        # Rolling averages (last 5 games)
+        rolling_5 = game_logs.head(5)
+        if len(rolling_5) > 0:
+            stats['rolling_5_pts'] = rolling_5['PTS'].mean()
+            stats['rolling_5_reb'] = rolling_5['REB'].mean()
+            stats['rolling_5_ast'] = rolling_5['AST'].mean()
+        else:
+            stats['rolling_5_pts'] = stats['career_avg_pts']
+            stats['rolling_5_reb'] = stats['career_avg_reb']
+            stats['rolling_5_ast'] = stats['career_avg_ast']
+        
+        return stats
+        
+    except Exception as e:
+        st.error(f"Error calculating stats: {str(e)}")
+        return None
+
+def predict_player_points(player_stats: dict, is_home: bool, opponent_team: str):
+    """Predict player points using multiple factors."""
+    if not player_stats:
+        return 0.0
     
-    start_time = time.time()
-    
-    # Get team rosters
-    home_roster = get_team_roster(home_team)
-    away_roster = get_team_roster(away_team)
-    
-    if not home_roster or not away_roster:
-        st.error("❌ Could not retrieve team rosters")
-        return None, None
-    
-    st.success(f"✅ Home Team ({home_team}): {len(home_roster)} players")
-    st.success(f"✅ Away Team ({away_team}): {len(away_roster)} players")
-    
-    # Analyze home team
-    st.markdown(f"### 🏠 Analyzing {home_team} (Home)")
-    home_analysis = nba_analyzer.get_team_analysis(home_roster, away_team, is_home=True)
-    
-    # Analyze away team
-    st.markdown(f"### ✈️ Analyzing {away_team} (Away)")
-    away_analysis = nba_analyzer.get_team_analysis(away_roster, home_team, is_home=False)
-    
-    end_time = time.time()
-    analysis_time = end_time - start_time
-    
-    st.success(f"🎉 Analysis completed in {analysis_time:.1f} seconds!")
-    
-    return home_analysis, away_analysis
+    try:
+        # Base prediction from career average
+        base_prediction = player_stats['career_avg_pts']
+        
+        # Adjust for recent form (30% weight)
+        recent_factor = player_stats['recent_avg_pts'] / base_prediction if base_prediction > 0 else 1
+        base_prediction *= (0.7 + 0.3 * recent_factor)
+        
+        # Adjust for home/away (20% weight)
+        if is_home:
+            home_factor = player_stats['home_avg_pts'] / base_prediction if base_prediction > 0 else 1
+            base_prediction *= (0.8 + 0.2 * home_factor)
+        else:
+            away_factor = player_stats['away_avg_pts'] / base_prediction if base_prediction > 0 else 1
+            base_prediction *= (0.8 + 0.2 * away_factor)
+        
+        # Adjust for opponent history (25% weight) - only if they've played at least 2 games
+        if player_stats['vs_opponent_games'] >= 2:
+            opponent_factor = player_stats['vs_opponent_pts'] / base_prediction if base_prediction > 0 else 1
+            base_prediction *= (0.75 + 0.25 * opponent_factor)
+        
+        # Adjust for rolling average (25% weight)
+        rolling_factor = player_stats['rolling_5_pts'] / base_prediction if base_prediction > 0 else 1
+        base_prediction *= (0.75 + 0.25 * rolling_factor)
+        
+        # Ensure prediction is reasonable
+        return max(0.0, min(50.0, base_prediction))
+        
+    except Exception as e:
+        st.error(f"Error predicting points: {str(e)}")
+        return player_stats.get('career_avg_pts', 0.0)
+
+def analyze_player(player_name: str, opponent_team: str, is_home: bool):
+    """Analyze a single player and predict their performance."""
+    try:
+        # Get player ID
+        player_id = get_player_id(player_name)
+        if not player_id:
+            return None
+        
+        # Get current season game logs
+        game_logs = get_player_game_logs(player_id, '2024-25')
+        if game_logs is None or len(game_logs) == 0:
+            # Try previous season if current season is empty
+            game_logs = get_player_game_logs(player_id, '2023-24')
+        
+        if game_logs is None or len(game_logs) == 0:
+            st.warning(f"No game data available for {player_name}")
+            return None
+        
+        # Preprocess game logs
+        processed_logs = preprocess_game_logs(game_logs)
+        if processed_logs is None:
+            return None
+        
+        # Calculate statistics
+        player_stats = calculate_player_stats(processed_logs, opponent_team)
+        if player_stats is None:
+            return None
+        
+        # Predict points
+        predicted_points = predict_player_points(player_stats, is_home, opponent_team)
+        
+        return {
+            'player_name': player_name,
+            'predicted_points': predicted_points,
+            'stats': player_stats,
+            'games_analyzed': len(processed_logs)
+        }
+        
+    except Exception as e:
+        st.error(f"Error analyzing {player_name}: {str(e)}")
+        return None
 
 def main():
-    st.markdown('<h1 class="main-header">🏀 NBA Comprehensive Predictions</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🏀 NBA Player Points Predictor</h1>', unsafe_allow_html=True)
     
     st.markdown("""
-    <div class="analysis-card">
-        <h3>🔍 Comprehensive NBA Player Analysis & Predictions</h3>
-        <p>Get detailed predictions for every player using 5 years of historical data, home/away splits, and advanced statistical analysis!</p>
+    <div class="prediction-card">
+        <h3>🎯 Predict Player Points Against Specific Teams</h3>
+        <p>Get accurate point predictions based on career averages, recent form, home/away splits, and opponent history!</p>
         <ul>
-            <li>📊 <strong>5 Years of Data:</strong> Comprehensive historical analysis from 2020-2025</li>
-            <li>🏠 <strong>Home/Away Splits:</strong> Performance differences in different venues</li>
-            <li>🎯 <strong>Opponent History:</strong> How players perform against specific teams</li>
-            <li>📈 <strong>Recent Form:</strong> Last 10 games performance trends</li>
-            <li>🤖 <strong>Advanced Metrics:</strong> Efficiency, consistency, and clutch factors</li>
-            <li>⚡ <strong>Real-time Analysis:</strong> Live data from NBA API</li>
+            <li>📊 <strong>Career Averages:</strong> Long-term performance baseline</li>
+            <li>🔥 <strong>Recent Form:</strong> Last 10 games performance</li>
+            <li>🏠 <strong>Home/Away Splits:</strong> Venue-specific performance</li>
+            <li>🎯 <strong>Opponent History:</strong> Performance against specific teams</li>
+            <li>📈 <strong>Rolling Averages:</strong> Last 5 games trends</li>
+            <li>⚡ <strong>Fast Analysis:</strong> Optimized for speed</li>
         </ul>
     </div>
     """, unsafe_allow_html=True)
     
     # Sidebar
-    st.sidebar.title("⚙️ Analysis Settings")
+    st.sidebar.title("⚙️ Settings")
     
-    st.sidebar.markdown("### 📊 Data Sources")
+    st.sidebar.markdown("### 📊 Prediction Factors")
     st.sidebar.info("""
-    - **NBA API**: Official statistics and game logs
-    - **5 Seasons**: 2020-21 through 2024-25
-    - **Real-time**: Live data fetching with caching
-    - **Comprehensive**: All available player statistics
-    """)
-    
-    st.sidebar.markdown("### 🎯 Prediction Factors")
-    st.sidebar.info("""
-    - **Career Averages**: 30% weight
+    - **Career Average**: 30% weight
     - **Recent Form**: 30% weight  
     - **Home/Away**: 20% weight
     - **Opponent History**: 25% weight
-    - **Season Trends**: 15% weight
-    - **Consistency**: 10% weight
+    - **Rolling Average**: 25% weight
     """)
     
-    # Cache management
-    st.sidebar.markdown("### 🗄️ Cache Management")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("🗑️ Clear Cache", help="Clear all cached data"):
-            nba_analyzer.clear_cache()
-    
-    with col2:
-        if st.button("ℹ️ Cache Info", help="Show cache information"):
-            cache_info = nba_analyzer.get_cache_info()
-            st.sidebar.json(cache_info)
-    
-    # Performance tips
-    st.sidebar.markdown("### 💡 Performance Tips")
+    st.sidebar.markdown("### 💡 How It Works")
     st.sidebar.info("""
-    - **First Run**: May take 2-3 minutes to fetch data
-    - **Subsequent Runs**: Much faster due to caching
-    - **Network Issues**: App will retry and show detailed errors
-    - **Data Quality**: All available NBA statistics are used
+    1. Enter player name and opponent team
+    2. App fetches recent game data
+    3. Calculates multiple statistical factors
+    4. Combines factors with weighted algorithm
+    5. Provides accurate point prediction
     """)
     
-    # Team selection
-    st.markdown("## 🏀 Select Teams for Analysis")
+    # Main interface
+    st.markdown("## 🎯 Player Analysis")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        home_team = st.selectbox(
-            "🏠 Home Team",
-            get_all_team_abbreviations(),
-            format_func=lambda x: f"{x} - {get_team_name(x)}"
+        # Player input
+        player_name = st.text_input(
+            "👤 Player Name",
+            placeholder="e.g., LeBron James, Stephen Curry",
+            help="Enter the full name of the player you want to analyze"
+        )
+        
+        # Team selection
+        all_teams = [team['abbreviation'] for team in teams.get_teams()]
+        opponent_team = st.selectbox(
+            "🏀 Opponent Team",
+            options=all_teams,
+            help="Select the team the player will be playing against"
         )
     
     with col2:
-        away_team = st.selectbox(
-            "✈️ Away Team", 
-            get_all_team_abbreviations(),
-            format_func=lambda x: f"{x} - {get_team_name(x)}",
-            index=1 if home_team == get_all_team_abbreviations()[0] else 0
+        # Home/Away selection
+        is_home = st.radio(
+            "🏠 Venue",
+            options=["Home", "Away"],
+            help="Is the player playing at home or away?"
+        )
+        
+        # Analysis button
+        analyze_button = st.button(
+            "🚀 Analyze Player",
+            type="primary",
+            use_container_width=True,
+            help="Click to start the analysis"
         )
     
-    if home_team == away_team:
-        st.error("❌ Please select different teams!")
-        return
-    
-    # Run analysis button
-    if st.button("🚀 Start Comprehensive Analysis", type="primary", use_container_width=True):
+    # Run analysis
+    if analyze_button and player_name:
+        if not player_name.strip():
+            st.error("❌ Please enter a player name!")
+            return
         
-        # Run analysis
-        home_analysis, away_analysis = run_comprehensive_analysis(home_team, away_team)
+        st.markdown("## 🔍 Analysis Results")
         
-        if home_analysis and away_analysis:
-            # Display results
-            st.markdown("## 📊 Analysis Results")
+        with st.spinner("🔍 Analyzing player performance..."):
+            # Analyze player
+            player_analysis = analyze_player(player_name.strip(), opponent_team, is_home == "Home")
             
-            # Team comparison
-            display_team_comparison(home_analysis, away_analysis)
-            
-            # Charts
-            create_prediction_charts(home_analysis, away_analysis)
-            
-            # Detailed player analysis
-            st.markdown("## 👥 Player-by-Player Analysis")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown(f"### 🏠 {home_team} Players")
-                for player_name, player_data in home_analysis.items():
-                    if player_name not in ['team_total', 'team_average']:
-                        display_player_analysis(player_name, player_data)
-            
-            with col2:
-                st.markdown(f"### ✈️ {away_team} Players")
-                for player_name, player_data in away_analysis.items():
-                    if player_name not in ['team_total', 'team_average']:
-                        display_player_analysis(player_name, player_data)
-            
-            # Summary
-            st.markdown("## 🎯 Game Prediction Summary")
-            
-            home_total = home_analysis['team_total']
-            away_total = away_analysis['team_total']
-            winner = home_team if home_total > away_total else away_team
-            margin = abs(home_total - away_total)
-            
-            st.success(f"🏆 **Predicted Winner**: {winner}")
-            st.info(f"📊 **Predicted Score**: {home_team} {home_total:.0f} - {away_team} {away_total:.0f}")
-            st.info(f"🎯 **Predicted Margin**: {margin:.1f} points")
-            st.info(f"⚡ **Total Points**: {home_total + away_total:.0f} points")
+            if player_analysis:
+                # Display results
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric(
+                        "🎯 Predicted Points",
+                        f"{player_analysis['predicted_points']:.1f}",
+                        help="Predicted points for the upcoming game"
+                    )
+                
+                with col2:
+                    st.metric(
+                        "📊 Career Average",
+                        f"{player_analysis['stats']['career_avg_pts']:.1f}",
+                        help="Player's career average points per game"
+                    )
+                
+                with col3:
+                    st.metric(
+                        "🔥 Recent Form",
+                        f"{player_analysis['stats']['recent_avg_pts']:.1f}",
+                        help="Average points in last 10 games"
+                    )
+                
+                # Detailed statistics
+                st.markdown("### 📈 Detailed Statistics")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("#### 🏠 Home/Away Performance")
+                    st.metric("Home Average", f"{player_analysis['stats']['home_avg_pts']:.1f}")
+                    st.metric("Away Average", f"{player_analysis['stats']['away_avg_pts']:.1f}")
+                    
+                    st.markdown("#### 🎯 Opponent History")
+                    if player_analysis['stats']['vs_opponent_games'] > 0:
+                        st.metric(
+                            f"vs {opponent_team}",
+                            f"{player_analysis['stats']['vs_opponent_pts']:.1f}",
+                            f"{player_analysis['stats']['vs_opponent_games']} games"
+                        )
+                    else:
+                        st.info(f"No previous games against {opponent_team}")
+                
+                with col2:
+                    st.markdown("#### 📊 Recent Trends")
+                    st.metric("Last 5 Games", f"{player_analysis['stats']['rolling_5_pts']:.1f}")
+                    st.metric("Last 10 Games", f"{player_analysis['stats']['recent_avg_pts']:.1f}")
+                    
+                    st.markdown("#### 🎯 Other Stats")
+                    st.metric("Rebounds", f"{player_analysis['stats']['career_avg_reb']:.1f}")
+                    st.metric("Assists", f"{player_analysis['stats']['career_avg_ast']:.1f}")
+                
+                # Prediction confidence
+                st.markdown("### 🎯 Prediction Confidence")
+                
+                confidence_score = 0
+                confidence_factors = []
+                
+                # Factor 1: Data availability
+                if player_analysis['games_analyzed'] >= 20:
+                    confidence_score += 25
+                    confidence_factors.append("✅ Extensive game data (20+ games)")
+                elif player_analysis['games_analyzed'] >= 10:
+                    confidence_score += 20
+                    confidence_factors.append("✅ Good game data (10+ games)")
+                else:
+                    confidence_score += 10
+                    confidence_factors.append("⚠️ Limited game data")
+                
+                # Factor 2: Opponent history
+                if player_analysis['stats']['vs_opponent_games'] >= 5:
+                    confidence_score += 25
+                    confidence_factors.append("✅ Strong opponent history (5+ games)")
+                elif player_analysis['stats']['vs_opponent_games'] >= 2:
+                    confidence_score += 20
+                    confidence_factors.append("✅ Good opponent history (2+ games)")
+                else:
+                    confidence_score += 10
+                    confidence_factors.append("⚠️ Limited opponent history")
+                
+                # Factor 3: Recent form consistency
+                recent_consistency = abs(player_analysis['stats']['recent_avg_pts'] - player_analysis['stats']['career_avg_pts']) / player_analysis['stats']['career_avg_pts']
+                if recent_consistency < 0.1:
+                    confidence_score += 25
+                    confidence_factors.append("✅ Consistent recent form")
+                elif recent_consistency < 0.2:
+                    confidence_score += 20
+                    confidence_factors.append("✅ Moderately consistent form")
+                else:
+                    confidence_score += 15
+                    confidence_factors.append("⚠️ Variable recent form")
+                
+                # Factor 4: Home/away consistency
+                home_away_diff = abs(player_analysis['stats']['home_avg_pts'] - player_analysis['stats']['away_avg_pts']) / player_analysis['stats']['career_avg_pts']
+                if home_away_diff < 0.15:
+                    confidence_score += 25
+                    confidence_factors.append("✅ Consistent home/away performance")
+                elif home_away_diff < 0.25:
+                    confidence_score += 20
+                    confidence_factors.append("✅ Moderate home/away difference")
+                else:
+                    confidence_score += 15
+                    confidence_factors.append("⚠️ Significant home/away difference")
+                
+                # Display confidence
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.metric("🎯 Confidence Score", f"{confidence_score}%")
+                    
+                    if confidence_score >= 80:
+                        st.success("🟢 High Confidence Prediction")
+                    elif confidence_score >= 60:
+                        st.warning("🟡 Medium Confidence Prediction")
+                    else:
+                        st.error("🔴 Low Confidence Prediction")
+                
+                with col2:
+                    st.markdown("#### 📋 Confidence Factors")
+                    for factor in confidence_factors:
+                        st.write(factor)
+                
+                # Summary
+                st.markdown("### 📝 Prediction Summary")
+                
+                venue_text = "home" if is_home == "Home" else "away"
+                st.info(f"""
+                **{player_name}** is predicted to score **{player_analysis['predicted_points']:.1f} points** 
+                against the **{opponent_team}** when playing **{venue_text}**.
+                
+                This prediction is based on {player_analysis['games_analyzed']} games of data with a confidence level of **{confidence_score}%**.
+                """)
+                
+            else:
+                st.error("❌ Could not analyze player. Please check the player name and try again.")
     
     # Footer
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: #666;'>
-        <p>🏀 Powered by NBA API • 📊 5 Years of Historical Data • 🤖 Advanced Statistical Analysis • ⚡ Real-time Predictions</p>
+        <p>🏀 Powered by NBA API • 📊 Advanced Statistical Analysis • ⚡ Fast & Accurate Predictions</p>
     </div>
     """, unsafe_allow_html=True)
 
