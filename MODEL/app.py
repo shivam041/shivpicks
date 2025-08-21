@@ -272,6 +272,28 @@ def main():
     - **Consistency**: 10% weight
     """)
     
+    # Cache management
+    st.sidebar.markdown("### 🗄️ Cache Management")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🗑️ Clear Cache", help="Clear all cached data"):
+            nba_analyzer.clear_cache()
+    
+    with col2:
+        if st.button("ℹ️ Cache Info", help="Show cache information"):
+            cache_info = nba_analyzer.get_cache_info()
+            st.sidebar.json(cache_info)
+    
+    # Performance tips
+    st.sidebar.markdown("### 💡 Performance Tips")
+    st.sidebar.info("""
+    - **First Run**: May take 2-3 minutes to fetch data
+    - **Subsequent Runs**: Much faster due to caching
+    - **Network Issues**: App will retry and show detailed errors
+    - **Data Quality**: All available NBA statistics are used
+    """)
+    
     # Team selection
     st.markdown("## 🏀 Select Teams for Analysis")
     
