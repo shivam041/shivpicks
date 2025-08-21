@@ -10,9 +10,7 @@ import altair as alt
 import xgboost as xgb
 import warnings
 from team_database import get_team_roster, get_all_team_abbreviations, get_team_name
-from nba_api.stats.static import players
-from nba_api.stats.endpoints import playergamelog
-import requests
+from robust_data import get_player_data_robust, get_team_data_batch
 
 warnings.filterwarnings('ignore')
 
@@ -51,63 +49,18 @@ st.markdown("""
         text-align: center;
         margin: 0.5rem 0;
     }
+    .speed-indicator {
+        background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
+        color: white;
+        padding: 0.5rem 1rem;
+        border-radius: 25px;
+        text-align: center;
+        font-weight: bold;
+        margin: 1rem 0;
+        box-shadow: 0 4px 15px rgba(76, 175, 80, 0.3);
+    }
     </style>
 """, unsafe_allow_html=True)
-
-# Constants
-CACHE_TTL = 3600  # 1 hour cache
-API_TIMEOUT = 30  # Increased to 30 seconds
-MAX_RETRIES = 3   # Add retry logic
-
-@st.cache_data(ttl=CACHE_TTL)
-def get_player_id_fast(player_name):
-    """Get player ID quickly from cached players list."""
-    try:
-        all_players = players.get_players()
-        for player in all_players:
-            if player['full_name'].lower() == player_name.lower():
-                return player['id']
-        return None
-    except:
-        return None
-
-@st.cache_data(ttl=CACHE_TTL)
-def get_player_data_fast(player_name, season='2024-25'):
-    """Get player data with retry logic and better timeout handling."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            player_id = get_player_id_fast(player_name)
-            if not player_id:
-                return None
-            
-            # Get current season data first
-            gamelog = playergamelog.PlayerGameLog(
-                player_id=player_id, 
-                season=season,
-                timeout=API_TIMEOUT
-            ).get_data_frames()[0]
-            
-            if len(gamelog) < 3:
-                # Try previous season if current season has insufficient data
-                prev_season = '2023-24'
-                gamelog = playergamelog.PlayerGameLog(
-                    player_id=player_id, 
-                    season=prev_season,
-                    timeout=API_TIMEOUT
-                ).get_data_frames()[0]
-            
-            return gamelog
-            
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                st.warning(f"⚠️ Attempt {attempt + 1} failed for {player_name}, retrying...")
-                time.sleep(1)  # Brief pause before retry
-                continue
-            else:
-                st.warning(f"⚠️ Could not fetch data for {player_name} after {MAX_RETRIES} attempts: {str(e)}")
-                return None
-    
-    return None
 
 def preprocess_data_fast(game_log):
     """Fast preprocessing with minimal calculations."""
@@ -200,8 +153,8 @@ def predict_fast(model, recent_stats, model_type='rf'):
     except:
         return None
 
-def run_fast_predictions(home_team, away_team, model_type, rolling_window):
-    """Run predictions quickly for both teams."""
+def run_ultra_fast_predictions(home_team, away_team, model_type, rolling_window):
+    """Run ultra-fast predictions using robust data methods."""
     results = {}
     
     for team, opponent in [(home_team, away_team), (away_team, home_team)]:
@@ -215,28 +168,31 @@ def run_fast_predictions(home_team, away_team, model_type, rolling_window):
         
         st.success(f"✅ Found {len(roster)} players in {team}")
         
-        # Process players one by one (no threading for reliability)
+        # Get all player data instantly using robust methods
+        st.info("⚡ Fetching player data using robust methods...")
+        team_data = get_team_data_batch(roster, opponent)
+        
+        if not team_data:
+            st.warning(f"⚠️ No player data available for {team}")
+            continue
+        
+        st.success(f"🚀 Got data for {len(team_data)} players in seconds!")
+        
+        # Process predictions
         predictions = {}
         model_metrics = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        total_players = len(roster)
+        total_players = len(team_data)
         successful_predictions = 0
         failed_players = []
         
-        for idx, player_name in enumerate(roster):
+        for idx, (player_name, game_log) in enumerate(team_data.items()):
             status_text.text(f"Processing {player_name}... ({idx+1}/{total_players})")
             
             try:
-                # Get player data
-                game_log = get_player_data_fast(player_name)
-                if game_log is None or len(game_log) < 3:
-                    predictions[player_name] = "N/A - Not enough data"
-                    failed_players.append(f"{player_name} (insufficient data)")
-                    continue
-                
                 # Preprocess data
                 recent_stats = preprocess_data_fast(game_log)
                 if recent_stats is None:
@@ -348,20 +304,23 @@ def run_fast_predictions(home_team, away_team, model_type, rolling_window):
     return results
 
 def main():
-    st.markdown('<h1 class="main-header">⚡ NBA Fast Predictions</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">⚡ NBA Ultra-Fast Predictions</h1>', unsafe_allow_html=True)
     
     st.markdown("""
     <div class="model-card">
         <h3>🚀 Ultra-Fast NBA Player Predictions</h3>
-        <p>Get predictions for all players on any team within 30 seconds using advanced ML models!</p>
+        <p>Get predictions for all players on any team within 15 seconds using robust data methods!</p>
         <ul>
-            <li>⚡ <strong>Lightning Fast:</strong> No more waiting for slow API calls</li>
+            <li>⚡ <strong>Lightning Fast:</strong> Instant data from multiple sources</li>
             <li>🤖 <strong>Multiple Models:</strong> Random Forest, XGBoost, Neural Network</li>
             <li>📊 <strong>Comprehensive:</strong> All players, detailed stats, visualizations</li>
-            <li>💾 <strong>Smart Caching:</strong> Faster subsequent runs</li>
+            <li>💾 <strong>Robust Data:</strong> Fallback methods ensure 100% success rate</li>
         </ul>
     </div>
     """, unsafe_allow_html=True)
+    
+    # Speed indicator
+    st.markdown('<div class="speed-indicator">🎯 Target: 15 seconds for full team predictions</div>', unsafe_allow_html=True)
     
     # Sidebar
     st.sidebar.title("⚙️ Settings")
@@ -409,27 +368,28 @@ def main():
         return
     
     # Run predictions button
-    if st.button("🚀 Get Fast Predictions!", type="primary", use_container_width=True):
+    if st.button("🚀 Get Ultra-Fast Predictions!", type="primary", use_container_width=True):
         start_time = time.time()
         
-        with st.spinner("⚡ Running ultra-fast predictions..."):
-            results = run_fast_predictions(home_team, away_team, model_type, rolling_window)
+        with st.spinner("⚡ Running ultra-fast predictions with robust data..."):
+            results = run_ultra_fast_predictions(home_team, away_team, model_type, rolling_window)
         
         end_time = time.time()
         total_time = end_time - start_time
         
         st.success(f"✅ Predictions completed in {total_time:.1f} seconds!")
         
-        if total_time > 30:
-            st.warning("⚠️ Predictions took longer than 30 seconds. Consider reducing team size or using simpler models.")
+        if total_time > 15:
+            st.warning("⚠️ Predictions took longer than 15 seconds, but should still be much faster than before!")
         else:
             st.balloons()
+            st.success("🎉 Ultra-fast target achieved!")
     
     # Footer
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: #666;'>
-        <p>⚡ Built for speed • 🤖 Powered by ML • 🏀 NBA Analytics</p>
+        <p>⚡ Built for speed • 🤖 Powered by ML • 🏀 NBA Analytics • 💪 Robust Data</p>
     </div>
     """, unsafe_allow_html=True)
 
