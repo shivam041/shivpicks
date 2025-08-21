@@ -1,26 +1,23 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from nba_api.stats.static import players
-from nba_api.stats.endpoints import playergamelog
-from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import time
-from requests.exceptions import ReadTimeout, ConnectionError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import altair as alt
 import xgboost as xgb
 import warnings
 from team_database import get_team_roster, get_all_team_abbreviations, get_team_name
+from optimized_api import nba_client, get_team_predictions_fast, get_players_data_batch_fast
 
 warnings.filterwarnings('ignore')
 
 # Set page config
 st.set_page_config(
-    page_title="NBA Player Points Predictions",
-    page_icon="🏀",
+    page_title="NBA Fast Predictions",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -35,10 +32,14 @@ st.markdown("""
         color: #FF6B35;
         margin-bottom: 30px;
     }
-    .sub-header {
-        font-size: 24px;
-        color: #2E86AB;
-        margin-bottom: 20px;
+    .speed-indicator {
+        background-color: #4CAF50;
+        color: white;
+        padding: 10px;
+        border-radius: 5px;
+        text-align: center;
+        font-weight: bold;
+        margin: 10px 0;
     }
     .metric-container {
         background-color: #f0f2f6;
@@ -46,103 +47,28 @@ st.markdown("""
         border-radius: 10px;
         margin: 10px 0;
     }
-    .stProgress .st-bo {
-        background-color: #FF6B35;
-    }
-    .model-card {
-        background-color: #f8f9fa;
-        padding: 20px;
-        border-radius: 10px;
-        border-left: 5px solid #FF6B35;
-        margin: 10px 0;
-    }
     </style>
     """, unsafe_allow_html=True)
 
 # Title
-st.markdown('<p class="main-header">NBA Player Points Predictions 🏀</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-header">⚡ NBA Fast Predictions 🏀</p>', unsafe_allow_html=True)
+
+# Speed indicator
+st.markdown('<div class="speed-indicator">🚀 Optimized for 30-second predictions!</div>', unsafe_allow_html=True)
 
 # Constants
 SEASON_CURRENT = '2024-25'
-SEASON_PREVIOUS = '2023-24'
-MAX_RETRIES = 2
-CACHE_TTL = 7200
-API_TIMEOUT = 15
-MAX_WORKERS = 5
+MAX_WORKERS = 3
+BATCH_SIZE = 5
 
-# Helper Functions
-@st.cache_data(ttl=CACHE_TTL)
-def get_player_id(player_name):
-    """Fetch player ID with error handling."""
-    try:
-        player_dict = players.find_players_by_full_name(player_name)
-        if not player_dict:
-            return None
-        return player_dict[0]['id']
-    except:
-        return None
-
-@st.cache_data(ttl=CACHE_TTL)
-def fetch_player_gamelog(player_id, season):
-    """Fetch player game log with optimized timeout."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            gamelog = playergamelog.PlayerGameLog(
-                player_id=player_id, 
-                season=season, 
-                timeout=API_TIMEOUT
-            ).get_data_frames()[0]
-            return gamelog
-        except:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(0.5)
-                continue
-            return None
-
-def get_player_data(player_name):
-    """Get player data for current and previous season."""
-    player_id = get_player_id(player_name)
-    if not player_id:
-        return None
-
-    gamelogs = []
-    for season in [SEASON_CURRENT, SEASON_PREVIOUS]:
-        gamelog = fetch_player_gamelog(player_id, season)
-        if gamelog is not None and not gamelog.empty:
-            gamelogs.append(gamelog)
-    
-    if gamelogs:
-        combined_data = pd.concat(gamelogs, ignore_index=True)
-        return combined_data
-    return None
-
-def fetch_all_player_data(roster):
-    """Fetch data for all players in roster."""
-    player_data = {}
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_player = {executor.submit(get_player_data, player): player for player in roster}
-        for future in as_completed(future_to_player):
-            player = future_to_player[future]
-            try:
-                data = future.result()
-                if data is not None and not data.empty:
-                    player_data[player] = data
-            except:
-                continue
-    return player_data
-
-def preprocess_game_log(game_log, rolling_window=5):
-    """Preprocess game log data."""
+def preprocess_game_log_fast(game_log, rolling_window=5):
+    """Fast preprocessing with minimal calculations."""
     try:
         game_log = game_log.copy()
-        game_log['GAME_DATE'] = pd.to_datetime(game_log['GAME_DATE'])    
-        game_log['HOME_AWAY'] = np.where(game_log['MATCHUP'].str.contains('@'), 'Away', 'Home')
+        game_log['GAME_DATE'] = pd.to_datetime(game_log['GAME_DATE'])
         
-        # Convert essential columns
-        essential_cols = ['PTS', 'REB', 'AST', 'BLK', 'STL', 'FGM', 'FGA', 'FG_PCT', 
-                         'FG3M', 'FG3A', 'FG3_PCT', 'FTM', 'FTA', 'FT_PCT', 
-                         'OREB', 'DREB', 'TOV', 'PF', 'PLUS_MINUS']
+        # Convert only essential columns
+        essential_cols = ['PTS', 'REB', 'AST', 'FGM', 'FGA', 'FG_PCT', 'FTM', 'FTA', 'FT_PCT']
         for col in essential_cols:
             if col in game_log.columns:
                 game_log[col] = pd.to_numeric(game_log[col], errors='coerce')
@@ -150,8 +76,8 @@ def preprocess_game_log(game_log, rolling_window=5):
         game_log = game_log.sort_values('GAME_DATE', ascending=True)
         game_log.fillna(method='ffill', inplace=True)
         
-        # Calculate rolling averages
-        for stat in ['PTS', 'REB', 'AST', 'BLK', 'STL', 'FGM', 'FGA', 'FTM', 'OREB', 'DREB']:
+        # Calculate only essential rolling averages
+        for stat in ['PTS', 'REB', 'AST']:
             if stat in game_log.columns:
                 game_log[f'AVG_{stat}'] = game_log[stat].rolling(window=rolling_window, min_periods=1).mean()
 
@@ -160,136 +86,72 @@ def preprocess_game_log(game_log, rolling_window=5):
     except:
         return None
 
-# ML Model Functions
-@st.cache_resource
-def train_random_forest_model(game_log):
-    """Train Random Forest model."""
+def train_model_fast(game_log, model_type='rf'):
+    """Fast model training with minimal features."""
     try:
-        features = game_log[['AVG_PTS', 'AVG_REB', 'AVG_AST', 'AVG_BLK', 'AVG_STL', 
-                            'FGM', 'FGA', 'FG_PCT', 'FG3M', 'FG3A', 'FG3_PCT', 
-                            'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'TOV', 'PF', 'PLUS_MINUS']]
-        target = game_log['PTS']
+        # Use only essential features for speed
+        feature_cols = ['AVG_PTS', 'AVG_REB', 'AVG_AST', 'FGM', 'FGA', 'FG_PCT', 'FTM', 'FTA', 'FT_PCT']
+        available_features = [col for col in feature_cols if col in game_log.columns]
         
-        if len(features) < 5:
+        if len(available_features) < 3 or len(game_log) < 5:
             return None, None
             
-        X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
-        model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-        model.fit(X_train, y_train)
+        features = game_log[available_features]
+        target = game_log['PTS']
         
+        X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
+        
+        if model_type == 'rf':
+            model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
+        elif model_type == 'xgb':
+            model = xgb.XGBRegressor(n_estimators=50, learning_rate=0.1, random_state=42, verbosity=0)
+        elif model_type == 'nn':
+            model = MLPRegressor(hidden_layer_sizes=(50, 25), max_iter=200, random_state=42)
+        else:
+            return None, None
+        
+        model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
-        mse = mean_squared_error(y_test, y_pred)
-        rmse = np.sqrt(mse)
-        mae = mean_absolute_error(y_test, y_pred)
+        
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
         r2 = r2_score(y_test, y_pred)
         
-        metrics = {'MSE': mse, 'RMSE': rmse, 'MAE': mae, 'R2': r2}
+        metrics = {'RMSE': rmse, 'R2': r2}
         return model, metrics
     except:
         return None, None
 
-@st.cache_resource
-def train_xgboost_model(game_log):
-    """Train XGBoost model."""
+def predict_fast(model, game_log, opponent_team):
+    """Fast prediction using minimal data."""
     try:
-        features = game_log[['AVG_PTS', 'AVG_REB', 'AVG_AST', 'AVG_BLK', 'AVG_STL', 
-                            'FGM', 'FGA', 'FG_PCT', 'FG3M', 'FG3A', 'FG3_PCT', 
-                            'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'TOV', 'PF', 'PLUS_MINUS']]
-        target = game_log['PTS']
-        
-        if len(features) < 5:
-            return None, None
+        if game_log is None or len(game_log) < 3:
+            return None
             
-        X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
-        model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, random_state=42, verbosity=0)
-        model.fit(X_train, y_train)
+        # Use recent averages for prediction
+        recent_stats = game_log.tail(3)[['AVG_PTS', 'AVG_REB', 'AVG_AST', 'FGM', 'FGA', 'FG_PCT', 'FTM', 'FTA', 'FT_PCT']].mean()
         
-        y_pred = model.predict(X_test)
-        mse = mean_squared_error(y_test, y_pred)
-        rmse = np.sqrt(mse)
-        mae = mean_absolute_error(y_test, y_pred)
-        r2 = r2_score(y_test, y_pred)
+        # Check which features the model expects
+        feature_cols = ['AVG_PTS', 'AVG_REB', 'AVG_AST', 'FGM', 'FGA', 'FG_PCT', 'FTM', 'FTA', 'FT_PCT']
+        available_features = [col for col in feature_cols if col in recent_stats.index]
         
-        metrics = {'MSE': mse, 'RMSE': rmse, 'MAE': mae, 'R2': r2}
-        return model, metrics
-    except:
-        return None, None
-
-@st.cache_resource
-def train_neural_network_model(game_log):
-    """Train Neural Network model."""
-    try:
-        features = game_log[['AVG_PTS', 'AVG_REB', 'AVG_AST', 'AVG_BLK', 'AVG_STL', 
-                            'FGM', 'FGA', 'FG_PCT', 'FG3M', 'FG3A', 'FG3_PCT', 
-                            'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'TOV', 'PF', 'PLUS_MINUS']]
-        target = game_log['PTS']
-        
-        if len(features) < 5:
-            return None, None
+        if len(available_features) < 3:
+            return None
             
-        X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
-        model = MLPRegressor(hidden_layer_sizes=(100, 50), max_iter=500, random_state=42)
-        model.fit(X_train, y_train)
-        
-        y_pred = model.predict(X_test)
-        mse = mean_squared_error(y_test, y_pred)
-        rmse = np.sqrt(mse)
-        mae = mean_absolute_error(y_test, y_pred)
-        r2 = r2_score(y_test, y_pred)
-        
-        metrics = {'MSE': mse, 'RMSE': rmse, 'MAE': mae, 'R2': r2}
-        return model, metrics
-    except:
-        return None, None
-
-def predict_with_model(model, average_stats, model_type='rf'):
-    """Predict player performance using trained model."""
-    try:
-        feature_order = ['AVG_PTS', 'AVG_REB', 'AVG_AST', 'AVG_BLK', 'AVG_STL', 
-                        'FGM', 'FGA', 'FG_PCT', 'FG3M', 'FG3A', 'FG3_PCT', 
-                        'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'TOV', 'PF', 'PLUS_MINUS']
-        features = np.array([average_stats.get(feature, 0) for feature in feature_order]).reshape(1, -1)
+        features = np.array([recent_stats[col] for col in available_features]).reshape(1, -1)
         prediction = model.predict(features)[0]
         return max(0, prediction)
     except:
         return None
 
-def monte_carlo_simulation(game_log, opponent_team, num_simulations=1000):
-    """Monte Carlo simulation for predictions."""
-    try:
-        opponent_games = game_log[game_log['MATCHUP'].str.contains(opponent_team)]
-        
-        if opponent_games.empty:
-            return None
-
-        points = opponent_games['PTS'].values
-        if len(points) < 2:
-            return None
-            
-        mean_val = points.mean()
-        std_val = points.std(ddof=1)
-        
-        simulated_values = np.random.normal(loc=mean_val, scale=std_val, size=num_simulations)
-        simulated_values = np.clip(simulated_values, a_min=0, a_max=None)
-        
-        return {
-            "mean": simulated_values.mean(),
-            "median": np.median(simulated_values),
-            "std": simulated_values.std(),
-            "ci_lower": np.percentile(simulated_values, 2.5),
-            "ci_upper": np.percentile(simulated_values, 97.5)
-        }
-    except:
-        return None
-
-def run_model_predictions(home_team, away_team, model_type, rolling_window):
-    """Run predictions for a specific model type."""
+def run_ultra_fast_predictions(home_team, away_team, model_type, rolling_window):
+    """Ultra-fast predictions using optimized methods."""
     results = {}
+    start_time = time.time()
     
     for team, opponent in [(home_team, away_team), (away_team, home_team)]:
         st.subheader(f"📊 {team} vs {opponent}")
         
-        # Get roster from local database (instant!)
+        # Get roster instantly from local database
         roster = get_team_roster(team)
         if not roster:
             st.error(f"❌ No roster found for {team}")
@@ -297,15 +159,72 @@ def run_model_predictions(home_team, away_team, model_type, rolling_window):
             
         st.success(f"✅ Found {len(roster)} players in {team}")
         
-        # Fetch player data
-        with st.spinner(f"⏳ Fetching data for {len(roster)} players..."):
-            player_data = fetch_all_player_data(roster)
+        # Try ultra-fast method first
+        st.info("⚡ Using ultra-fast prediction method...")
+        
+        try:
+            # Get quick predictions using team-level data
+            quick_predictions = get_team_predictions_fast(roster, opponent)
+            
+            if quick_predictions and any(v > 0 for v in quick_predictions.values()):
+                st.success("🚀 Ultra-fast predictions generated!")
+                
+                # Display results immediately
+                valid_predictions = {k: v for k, v in quick_predictions.items() if v > 0}
+                
+                if valid_predictions:
+                    sorted_preds = sorted(valid_predictions.items(), key=lambda x: x[1], reverse=True)
+                    
+                    # Quick metrics
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("🏆 Top Scorer", sorted_preds[0][0], f"{sorted_preds[0][1]:.1f} pts")
+                    with col2:
+                        avg_pts = np.mean(list(valid_predictions.values()))
+                        st.metric("📈 Team Average", f"{avg_pts:.1f} pts", f"{len(valid_predictions)} players")
+                    with col3:
+                        total_pts = sum(valid_predictions.values())
+                        st.metric("🎯 Projected Total", f"{total_pts:.0f} pts", "from analyzed players")
+                    
+                    # Quick chart
+                    df_preds = pd.DataFrame(list(valid_predictions.items()), columns=['Player', 'Predicted Points'])
+                    df_preds = df_preds.sort_values('Predicted Points', ascending=False)
+                    
+                    chart = alt.Chart(df_preds).mark_bar(color='#4CAF50').encode(
+                        x=alt.X('Player:N', sort='-y', title='Players'),
+                        y=alt.Y('Predicted Points:Q', title='Predicted Points'),
+                        tooltip=['Player:N', 'Predicted Points:Q']
+                    ).properties(
+                        title=f'⚡ Fast Predictions: {team} vs {opponent}',
+                        width=600,
+                        height=400
+                    )
+                    
+                    st.altair_chart(chart, use_container_width=True)
+                    
+                    results[team] = valid_predictions
+                    
+                    # Show all predictions
+                    st.markdown("### 📋 All Player Predictions")
+                    df_all = pd.DataFrame(list(quick_predictions.items()), columns=['Player', 'Prediction'])
+                    st.dataframe(df_all, use_container_width=True)
+                    
+                    continue  # Skip to next team
+                    
+        except Exception as e:
+            st.warning(f"⚠️ Ultra-fast method failed, falling back to standard method...")
+        
+        # Fallback to standard method if ultra-fast fails
+        st.info(f"📈 Fetching detailed data for {len(roster)} players...")
+        
+        # Fetch player data in batches
+        player_data = get_players_data_batch_fast(roster)
         
         if not player_data:
             st.warning(f"⚠️ No player data available for {team}")
             continue
             
-        st.info(f"📈 Analyzing {len(player_data)} players with {model_type} model...")
+        st.info(f"🤖 Training {model_type} models...")
         
         predictions = {}
         model_metrics = []
@@ -319,47 +238,23 @@ def run_model_predictions(home_team, away_team, model_type, rolling_window):
             status_text.text(f"Processing {player_name}... ({idx+1}/{total_players})")
             
             try:
-                processed_log = preprocess_game_log(game_log, rolling_window)
+                processed_log = preprocess_game_log_fast(game_log, rolling_window)
                 if processed_log is None or len(processed_log) < 3:
                     predictions[player_name] = "N/A - Not enough data"
                     continue
 
                 # Train model based on type
-                if model_type == "Random Forest":
-                    model, metrics = train_random_forest_model(processed_log)
-                elif model_type == "XGBoost":
-                    model, metrics = train_xgboost_model(processed_log)
-                elif model_type == "Neural Network":
-                    model, metrics = train_neural_network_model(processed_log)
-                elif model_type == "Monte Carlo":
-                    model, metrics = None, None
+                model_type_short = 'rf' if 'Random Forest' in model_type else 'xgb' if 'XGBoost' in model_type else 'nn'
+                model, metrics = train_model_fast(processed_log, model_type_short)
                 
                 if model is not None:
                     model_metrics.append(metrics)
+                    prediction = predict_fast(model, processed_log, opponent)
                     
-                    # Prepare features for prediction
-                    opponent_games = processed_log[processed_log['MATCHUP'].str.contains(opponent)]
-                    if opponent_games.empty:
-                        average_stats = processed_log.iloc[-1][['AVG_PTS', 'AVG_REB', 'AVG_AST', 'AVG_BLK', 'AVG_STL', 
-                                                            'FGM', 'FGA', 'FG_PCT', 'FG3M', 'FG3A', 'FG3_PCT', 
-                                                            'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'TOV', 'PF', 'PLUS_MINUS']].to_dict()
-                    else:
-                        average_stats = opponent_games[['AVG_PTS', 'AVG_REB', 'AVG_AST', 'AVG_BLK', 'AVG_STL', 
-                                                       'FGM', 'FGA', 'FG_PCT', 'FG3M', 'FG3A', 'FG3_PCT', 
-                                                       'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'TOV', 'PF', 'PLUS_MINUS']].mean().to_dict()
-                    
-                    prediction = predict_with_model(model, average_stats, model_type.lower())
                     if prediction is not None:
                         predictions[player_name] = f"{prediction:.1f}"
                     else:
                         predictions[player_name] = "N/A - Prediction failed"
-                        
-                elif model_type == "Monte Carlo":
-                    mc_result = monte_carlo_simulation(processed_log, opponent)
-                    if mc_result is not None:
-                        predictions[player_name] = f"{mc_result['mean']:.1f} ± {mc_result['std']:.1f}"
-                    else:
-                        predictions[player_name] = "N/A - Not enough data"
                 else:
                     predictions[player_name] = "N/A - Model training failed"
                     
@@ -384,10 +279,7 @@ def run_model_predictions(home_team, away_team, model_type, rolling_window):
                 numeric_predictions = {}
                 for player, pred in valid_predictions.items():
                     try:
-                        if "±" in pred:  # Monte Carlo format
-                            numeric_predictions[player] = float(pred.split("±")[0].strip())
-                        else:
-                            numeric_predictions[player] = float(pred)
+                        numeric_predictions[player] = float(pred)
                     except:
                         continue
                 
@@ -426,38 +318,37 @@ def run_model_predictions(home_team, away_team, model_type, rolling_window):
             df_all = pd.DataFrame(list(predictions.items()), columns=['Player', 'Prediction'])
             st.dataframe(df_all, use_container_width=True)
             
-            # Show model metrics if available
-            if model_metrics and model_type != "Monte Carlo":
-                with st.expander("📈 Model Performance Metrics"):
-                    avg_rmse = np.mean([m['RMSE'] for m in model_metrics if m])
-                    avg_r2 = np.mean([m['R2'] for m in model_metrics if m])
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Average RMSE", f"{avg_rmse:.2f}")
-                    with col2:
-                        st.metric("Average R² Score", f"{avg_r2:.3f}")
-            
             results[team] = predictions
         else:
             st.warning(f"⚠️ No predictions available for {team}")
         
         st.markdown("---")
     
+    # Show timing
+    elapsed_time = time.time() - start_time
+    st.success(f"⏱️ Total analysis time: {elapsed_time:.1f} seconds")
+    
+    if elapsed_time <= 30:
+        st.balloons()
+        st.success("🎉 Target achieved! Predictions generated within 30 seconds!")
+    else:
+        st.warning(f"⚠️ Target missed by {elapsed_time - 30:.1f} seconds")
+    
     return results
 
 def main():
-    """Main application with all ML models."""
+    """Main application optimized for speed."""
     
     # Sidebar
     with st.sidebar:
-        st.title("🏀 NBA Predictions")
+        st.title("⚡ Fast NBA Predictions")
         st.markdown("---")
         
         # Model selection
         st.subheader("🤖 Select ML Model")
         model_type = st.selectbox(
             "Choose Model:",
-            ["Random Forest", "XGBoost", "Neural Network", "Monte Carlo"],
+            ["Random Forest", "XGBoost", "Neural Network"],
             help="Different ML approaches for predictions"
         )
         
@@ -478,41 +369,40 @@ def main():
         rolling_window = st.slider(
             "Rolling Window Size", 
             min_value=3, 
-            max_value=15, 
+            max_value=10, 
             value=5,
-            help="Number of recent games to average"
+            help="Number of recent games to average (smaller = faster)"
         )
         
         st.markdown("---")
         
-        # Model info
-        st.markdown("### 📊 Model Info")
-        if model_type == "Random Forest":
-            st.info("🌳 Ensemble of decision trees for robust predictions")
-        elif model_type == "XGBoost":
-            st.info("🚀 Gradient boosting for high-accuracy predictions")
-        elif model_type == "Neural Network":
-            st.info("🧠 Deep learning approach for complex patterns")
-        elif model_type == "Monte Carlo":
-            st.info("🎲 Statistical simulation for probability distributions")
+        # Speed info
+        st.markdown("### 🚀 Speed Features")
+        st.info("""
+        - **Local team database** - Instant roster loading
+        - **Batch API calls** - Multiple players at once
+        - **Smart caching** - 24-hour data retention
+        - **Rate limiting** - Prevents API blocks
+        - **Fallback methods** - Quick predictions when possible
+        """)
         
         st.markdown("---")
         
         # Run button
-        run_analysis = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
+        run_analysis = st.button("⚡ Run Ultra-Fast Analysis", type="primary", use_container_width=True)
         
         if run_analysis:
-            st.success("Analysis started!")
+            st.success("🚀 Ultra-fast analysis started!")
     
     # Main content
     if run_analysis:
         st.markdown(f"### 🎯 {model_type} Predictions")
         
-        with st.spinner(f"🔄 Running {model_type} predictions..."):
-            results = run_model_predictions(home_team, away_team, model_type, rolling_window)
+        with st.spinner(f"⚡ Running ultra-fast {model_type} predictions..."):
+            results = run_ultra_fast_predictions(home_team, away_team, model_type, rolling_window)
         
         if results:
-            st.success("✅ Analysis complete!")
+            st.success("✅ Ultra-fast analysis complete!")
             
             # Summary comparison
             if len(results) == 2:
@@ -526,10 +416,7 @@ def main():
                         numeric_values = []
                         for pred in valid_predictions.values():
                             try:
-                                if "±" in pred:
-                                    numeric_values.append(float(pred.split("±")[0].strip()))
-                                else:
-                                    numeric_values.append(float(pred))
+                                numeric_values.append(float(pred))
                             except:
                                 continue
                         
@@ -545,38 +432,38 @@ def main():
     
     else:
         # Landing page
-        st.markdown("### 🎮 Welcome to NBA ML Predictions!")
+        st.markdown("### 🎮 Welcome to NBA Ultra-Fast Predictions!")
         
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown("""
-            **🎯 Features:**
-            - Multiple ML models
-            - Instant team rosters
-            - All players analyzed
-            - Interactive charts
+            **⚡ Speed Features:**
+            - Local team database
+            - Batch API processing
+            - Smart caching
+            - Rate limiting
             """)
         
         with col2:
             st.markdown("""
-            **⚡ Performance:**
-            - Local database
-            - Fast predictions
-            - Smart caching
-            - Responsive UI
+            **🤖 ML Models:**
+            - Random Forest
+            - XGBoost
+            - Neural Network
+            - Optimized training
             """)
         
         with col3:
             st.markdown("""
-            **📊 Models:**
-            - Random Forest
-            - XGBoost
-            - Neural Network
-            - Monte Carlo
+            **🎯 Performance:**
+            - Target: 30 seconds
+            - All players analyzed
+            - Interactive charts
+            - Complete results
             """)
         
         st.markdown("---")
-        st.info("👈 Use the sidebar to select your model and teams!")
+        st.info("👈 Use the sidebar to start your ultra-fast analysis!")
 
 if __name__ == "__main__":
     main()
